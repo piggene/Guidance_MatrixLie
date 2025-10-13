@@ -39,14 +39,15 @@ def main(args, cfg):
     # Setup plotly visualizer
     visualizer = PlotlySubplotsVisualizer(rows=1, cols=test_loader.dataset.num_rots)
 
-    # Start test
-    results = test(model, test_loader, cfg.device, visualizer)
+    # Get guide type
+    guide_type = args.guide_type
 
+    results = test(model, test_loader, cfg.device, visualizer, guide_type)
     # Save plotly figure
     save_figure(args.logdir, visualizer)
 
 
-def test(model, test_loader, device, visualizer):
+def test(model, test_loader, device, visualizer, guide_type):
     # Initialize
     model.eval()
 
@@ -73,7 +74,7 @@ def test(model, test_loader, device, visualizer):
             Ts_grasp_rots_target = torch.Tensor(Ts_grasp_rots_target).to(device)
             # Sample grasp poses
             # Ts_grasp_rots_pred = model.sample(pc_rots, nums_grasps)
-            Ts_grasp_rots_pred = model.guided_sample(pc_rots,  Ts_grasp_rots_target, NUM_GRASPS)
+            Ts_grasp_rots_pred = model.guided_sample(pc_rots,  Ts_grasp_rots_target, NUM_GRASPS, guide_type)
 
             # Compute metrics
             for k, (mesh, Ts_grasp_pred, Ts_grasp_target) in enumerate(zip(mesh_list_rots, Ts_grasp_rots_pred, Ts_grasp_rots_target)):
@@ -102,7 +103,6 @@ def save_figure(logdir, visualizer):
     # Get number of traces and number of subplots
     num_traces = len(visualizer.fig.data)
     num_subplots = visualizer.num_subplots
-
     # Make only the first scene visible
     for idx_trace in range(num_subplots*(1+NUM_GRASPS), num_traces):
         visualizer.fig.update_traces(visible=False, selector=idx_trace)
@@ -136,6 +136,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--train_result_path', type=str)
     parser.add_argument('--checkpoint', type=str)
+    parser.add_argument('--guide_type', type=str, default='mc')
     parser.add_argument('--device', default=0)
     parser.add_argument('--logdir', default='test_results')
     parser.add_argument('--run', type=str, default=datetime.now().strftime('%Y%m%d-%H%M'))
@@ -161,7 +162,7 @@ if __name__ == '__main__':
     # Setup logdir
     # config_basename = os.path.splitext(config_filename)[0]
     config_basename = 'equigrasp_guidance'
-
+    args.run = args.run+f'_{args.guide_type}'
     args.logdir = os.path.join(args.logdir, config_basename, args.run)
 
     os.makedirs(args.logdir, exist_ok=True)

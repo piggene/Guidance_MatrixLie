@@ -172,41 +172,54 @@ def exp_so3(w_vec):
 
     return R
 
-
 def exp_se3(S):
+    # Accept (N,6) twist vectors or (N,4,4) se(3) matrices
     if S.shape[1:] == (4, 4):
         S = bracket_se3(S)
     elif S.shape[1:] != (6,):
         raise f"exp_se3: input must be of shape (N, 6) or (N, 4, 4). Current shape: {tuple(S.shape)}"
 
-    w_vec = S[:, :3]
-    p = S[:, 3:]
+    w = S[:, :3]   # (N,3)
+    v = S[:, 3:]   # (N,3)
+    N = S.shape[0]
 
-    T = torch.eye(4).repeat(len(S), 1, 1).to(S)
+    T = torch.eye(4, dtype=S.dtype, device=S.device).repeat(N, 1, 1)
+    # T[..., 3, 3] already 1
 
-    theta = w_vec.norm(dim=1)
+    theta = torch.linalg.norm(w, dim=1)  # (N,)
+    is_regular  = theta > EPS
+    is_singular = ~is_regular
 
-    is_regular = theta > EPS
-    is_singular = theta <= EPS
+    # --- regular branch (theta > EPS) ---
+    if is_regular.any():
+        w_reg = w[is_regular]                      # (Nr,3)
+        v_reg = v[is_regular]                      # (Nr,3)
+        th    = theta[is_regular].unsqueeze(-1).unsqueeze(-1)  # (Nr,1,1)
 
-    w_vec_regular = w_vec[is_regular]
-    theta_regular = theta[is_regular]
+        Omega  = bracket_so3(w_reg)                # (Nr,3,3)  [ω]×
+        Omega2 = Omega @ Omega                     # (Nr,3,3)
+        I3r    = torch.eye(3, dtype=S.dtype, device=S.device).expand_as(Omega)
 
-    theta_regular = theta_regular.unsqueeze(1)
+        # Rodrigues for R, and V(θ) for translation
+        A = torch.sin(th) / th
+        B = (1.0 - torch.cos(th)) / (th * th)
+        C = (th - torch.sin(th)) / (th * th * th)
 
-    w_mat_hat_regular = bracket_so3(w_vec_regular / theta_regular)
+        R_reg = I3r + A * Omega + B * Omega2
+        V_reg = I3r + B * Omega + C * Omega2
+        t_reg = (V_reg @ v_reg.unsqueeze(-1)).squeeze(-1)      # (Nr,3)
 
-    theta_regular = theta_regular.unsqueeze(2)
+        T[is_regular, :3, :3] = R_reg
+        T[is_regular, :3, 3]  = t_reg
 
-    G = theta_regular * torch.eye(3).repeat(len(S), 1, 1).to(S) + (1 - torch.cos(theta_regular)) * w_mat_hat_regular + (theta_regular - torch.cos(theta_regular)) * w_mat_hat_regular @ w_mat_hat_regular
-
-    T[is_regular, :3, :3] = exp_so3(w_vec_regular)
-    T[is_regular, :3, 3] = torch.einsum('nij,nj->ni', G, p)
-
-    T[is_singular, :3, :3] = torch.eye(3).repeat(is_singular.sum(), 1, 1)
-    T[is_singular, :3, 3] = p
+    # --- singular branch (theta ≈ 0) ---
+    if is_singular.any():
+        idx = is_singular
+        T[idx, :3, :3] = torch.eye(3, dtype=S.dtype, device=S.device).expand(idx.sum(), 3, 3)
+        T[idx, :3, 3]  = v[idx]  # use the matching subset
 
     return T
+
 
 
 def large_adjoint(T):
