@@ -136,7 +136,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--train_result_path', type=str)
     parser.add_argument('--checkpoint', type=str)
-    parser.add_argument('--guide_type', type=str, default='mc')
+    parser.add_argument('--guide_type', type=str, default='none')
     parser.add_argument('--device', default=0)
     parser.add_argument('--logdir', default='test_results')
     parser.add_argument('--run', type=str, default=datetime.now().strftime('%Y%m%d-%H%M'))

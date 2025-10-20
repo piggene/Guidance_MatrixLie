@@ -1,0 +1,8 @@
+<mujoco>
+  <compiler angle="radian" meshdir="."/>
+  <option gravity="0 0 -9.81" integrator="RK4"/>
+  <include file="panda.xml"/>
+  <worldbody>
+    <geom name="floor" type="plane" size="2 2 0.1" rgba="0.2 0.2 0.2 1"/>
+  </worldbody>
+</mujoco>

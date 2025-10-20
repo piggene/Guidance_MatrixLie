@@ -111,7 +111,7 @@ class EquiGraspFlow(torch.nn.Module):
         # print(t.shape) #[N, 1]
         # print(x_t.shape) #[N,4,4]
         self.guidance = 2
-        D = x_1.shape[0]
+        D = x_1.shape[0] if x_1 is not None else 100
         v_t = (1 - self.guidance) * self.vector_field(torch.zeros_like(z), t, x_t) + self.guidance * self.vector_field(z, t, x_t)
         # print(x_t[:,0,3].mean())
         if self.guide_type == 'mc':
@@ -120,7 +120,9 @@ class EquiGraspFlow(torch.nn.Module):
             g_t =  self.guidance_vector_sim_MC(D,t,x_t)
         elif self.guide_type == 'grad':
             g_t = self.guidance_vector_grad(t,x_t,v_t)
-        else:
+        elif self.guide_type == 'none':
+            g_t = torch.zeros_like(v_t)
+        else:   
             raise ValueError('Unknown guide type')
         norms = torch.linalg.vector_norm(g_t, dim=1, keepdim=True)  # (N, 1) L2 norms
         mean_norm = norms.mean()    
@@ -378,7 +380,6 @@ class EquiGraspFlow(torch.nn.Module):
 
             # 2 Re-leaf x1 so it definitely requires grad and does NOT backprop through x_t or g
             x1 = x1.detach().requires_grad_(True)
-            print(x1[:,0,3].mean()) 
             # 3 Compute dJ/dx1
             J = self.J(x1)                         # shape (N,) or (N,1); must NOT call .item() or .detach() inside
             dJ_dx1, = torch.autograd.grad(
@@ -392,19 +393,19 @@ class EquiGraspFlow(torch.nn.Module):
             xi1 = self.left_triv_grad_from_matrix_grad_SE3(
                 x1, dJ_dx1, alpha=alpha, beta=beta, M=M, M_inv=M_inv
             )                                      # (N,6)
-            xi1 = xi1/40000*(1-t)*2/t.clip(min=0.05)  # scale guidance to be similar magnitude as v_t
             # 5 Pull back to x_t via coadjoint: xi_t = (Ad_{g^{-1}})^* xi1
             xi_t = self.pullback_coadjoint(
                 xi1, g, alpha=alpha, beta=beta, M=M, M_inv=M_inv
             )                                      # (N,6)
+            xi_t = xi_t/7000*(t)/(1-t).clip(0.05) 
         # 6 Guidance is negative gradient
-        return -xi_t
+        return -xi_t #-xi_t
 
 
     # def J(self, x):
     #     """
     #     Selects grasp poses with negative x only.
-    #     Input:
+    #     Input: 
     #         x: (..., 4, 4) SE(3) transforms. Supports (D,4,4) or (N,D,4,4).
     #     Return:
     #         (..., 1) penalty. (D,1) if input is (D,4,4); (N,D,1) if (N,D,4,4).
@@ -421,31 +422,32 @@ class EquiGraspFlow(torch.nn.Module):
     #     )
     #     return penalty.unsqueeze(-1)            # (..., 1)
 
-    
-    def J(self, x, x0=0.1):
-        """
-        Penalize deviation of the grasp x-position from x0.
 
-        Args:
-            x: (..., 4, 4) SE(3) transforms. Supports (D,4,4) or (N,D,4,4).
-            x0: target x-position (float or tensor), in the same units as t_x/8 below.
+    # # Alternative J function: cubic penalty for deviation from target x0    
+    # def J(self, x, x0=0.1):
+    #     """
+    #     Penalize deviation of the grasp x-position from x0.
 
-        Returns:
-            penalty: (..., 1) tensor. (D,1) if input is (D,4,4), (N,D,1) if (N,D,4,4).
-        """
-        # translation vector
-        t = x[..., :3, 3]  # (..., 3)
+    #     Args:
+    #         x: (..., 4, 4) SE(3) transforms. Supports (D,4,4) or (N,D,4,4).
+    #         x0: target x-position (float or tensor), in the same units as t_x/8 below.
 
-        # make x0 a tensor on the right device/dtype
-        x0 = torch.as_tensor(x0, dtype=t.dtype, device=t.device)
+    #     Returns:
+    #         penalty: (..., 1) tensor. (D,1) if input is (D,4,4), (N,D,1) if (N,D,4,4).
+    #     """
+    #     # translation vector
+    #     t = x[..., :3, 3]  # (..., 3)
 
-        # deviation along x with the same scaling used before (scale = 8)
-        dx = (t[..., 0] - x0 * 8).abs()  # (...)
+    #     # make x0 a tensor on the right device/dtype
+    #     x0 = torch.as_tensor(x0, dtype=t.dtype, device=t.device)
 
-        # cubic penalty
-        penalty = (10.0 * dx).pow(3)  # (...)
+    #     # deviation along x with the same scaling used before (scale = 8)
+    #     dx = (t[..., 0] - x0 * 8).abs()  # (...)
 
-        return penalty.unsqueeze(-1)  # (..., 1)
+    #     # cubic penalty
+    #     penalty = (10.0 * dx).pow(3)  # (...)
+
+    #     return penalty.unsqueeze(-1)  # (..., 1)
 
 
 
@@ -464,7 +466,7 @@ class EquiGraspFlow(torch.nn.Module):
             z = self.encoder(mesh.unsqueeze(0))
             z = z.repeat_interleave(Num_Grasp, dim=0)
 
-            #sample x_0 (this is for sampliNum_Grasp trajectory not guidance...)
+            #sample x_0 (this is for sampling trajectory not guidance...)
             x_0 = self.init_dist(Num_Grasp, pc.device)
             self.X0SAMPLED = deepcopy(x_0)
             # Push-forward initial samples
@@ -475,6 +477,17 @@ class EquiGraspFlow(torch.nn.Module):
             x_1_hat_rot[k,:,:,:] = x_1_hat
 
         return x_1_hat_rot
+    
+    def single_guide_sample(self, pc, guide_type, energy_cost= None):
+        z =self.encoder(pc.unsqueeze(0))
+        self.guide_type = guide_type
+        x_0 = self.init_dist(1, pc.device)
+        if not callable(energy_cost):
+            raise TypeError("fn must be callable")
+        self.J = energy_cost
+        x_1_ = self.ode_solver(z, x_0, None, self.guided_vector_field_with_guidance)[:, -1]
+        return x_1_
+
 
 def batch_covariance(w, v):
     """
