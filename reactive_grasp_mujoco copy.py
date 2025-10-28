@@ -8,7 +8,7 @@ import mujoco
 import math
 from mujoco import viewer
 from omegaconf import OmegaConf
-from reach_energy_cost import init_energy_cost_irn
+
 
 # your modules
 from loaders import get_dataloader
@@ -17,7 +17,8 @@ from metrics import get_metrics
 from utils.visualization import PlotlySubplotsVisualizer
 from envs.lib.LieGroup import *   # for SO3_to_quaternion etc.
 
-
+# at top
+from energy_cost_rm4d import rm4d_load, energy_cost as _energy_cost_world
 
 
 # -------------------------- Configs / Constants --------------------------
@@ -32,6 +33,64 @@ LAM_BASE         = 1e-3    # DLS damping (auto-ramps near singularities)
 
 # -------------------------- Utils --------------------------
 
+# --- RM4D energy wrapper that tracks the *current* object pose (MuJoCo) ---
+class EnergyCostRM4D:
+    """
+    Callable: energy_cost(T_obj) -> (...,1) (0 if feasible, 100 otherwise)
+    - Reads current object pose from MuJoCo (R_obj, p_obj)
+    - Converts T_obj (object frame; translation in model units) -> world (meters)
+    - Queries RM4D energy
+    Also provides: compose(T_obj) -> T_world (to execute the same pose in IK)
+    """
+    def __init__(self, device, s_total, m, d, obj_body, rm4d_energy_fn):
+        self.device = device
+        self.m = m
+        self.d = d
+        self.obj_body = obj_body
+        self.rm4d_energy = rm4d_energy_fn
+        self.S_TOTAL = torch.tensor(float(s_total), dtype=torch.float32, device=device)
+
+        # buffers to avoid reallocs each call
+        self.R_obj = torch.empty((3,3), dtype=torch.float32, device=device)
+        self.p_obj = torch.empty((3,),   dtype=torch.float32, device=device)
+
+    def _refresh_obj_pose(self):
+        # Pull MuJoCo state (NumPy) -> GPU tensors
+        Rnp = self.d.xmat[self.obj_body].reshape(3,3).copy()
+        pnp = self.d.xpos[self.obj_body].copy()
+        self.R_obj.copy_(torch.from_numpy(Rnp).to(self.device))
+        self.p_obj.copy_(torch.from_numpy(pnp).to(self.device))
+
+    @torch.no_grad()
+    def compose(self, T_obj: torch.Tensor) -> torch.Tensor:
+        """
+        T_obj: (...,4,4) OBJECT frame (model units). Returns world-frame (...,4,4) meters.
+        """
+        T_obj = T_obj.to(self.device)
+        self._refresh_obj_pose()
+
+        lead = T_obj.shape[:-2]
+        R_rel = T_obj[..., :3, :3]               # (...,3,3)
+        t_rel = T_obj[..., :3, 3]                # (...,3)
+        t_m   = self.S_TOTAL * t_rel             # (...,3) meters
+
+        # Rw = R_obj * R_rel;  pw = p_obj + R_obj * t_m
+        Rw = torch.einsum("ij,...jk->...ik", self.R_obj, R_rel)
+        pw = self.p_obj + torch.einsum("ij,...j->...i", self.R_obj, t_m)
+
+        T_w = torch.zeros((*lead, 4, 4), dtype=T_obj.dtype, device=T_obj.device)
+        T_w[..., :3, :3] = Rw
+        T_w[..., :3, 3]  = pw
+        T_w[..., 3, 3]   = 1.0
+        return T_w
+
+    @torch.no_grad()
+    def __call__(self, T_obj: torch.Tensor) -> torch.Tensor:
+        """
+        Returns (...,1): 0 if RM4D says reachable, else 100.
+        """
+        T_w = self.compose(T_obj)
+        return self.rm4d_energy(T_w)
 
 def _minjerk(s):  # s in [0,1]
     return s**3 * (10 - 15*s + 6*s*s)
@@ -275,6 +334,108 @@ def build_mujoco_scene_with_include(
     mujoco.mj_forward(m, d)
     return m, d, tmp_path
 
+# -------------------------- RM4D viz helpers --------------------------
+def _linspace_centers(lo, hi, n):
+    if n <= 1: return np.array([(lo + hi) * 0.5], dtype=float)
+    return np.linspace(lo, hi, n)
+
+def _rm4d_envelope_rmax_per_z(pack, z_samples, a_min, a_max):
+    """
+    For each z in z_samples (world meters), compute the max reachable XY radius r.
+    We collapse alpha with any(), then take max radius over occupied XY bins.
+    """
+    G = pack["grid"]
+    if isinstance(G, torch.Tensor):
+        G = G.to('cpu', dtype=torch.uint8).numpy()
+    nbx, nby, nz, na = G.shape
+
+    bx_lo, bx_hi = pack["bx_range"]
+    by_lo, by_hi = pack["by_range"]
+    z_lo,  z_hi  = pack["z_range"]
+    a_lo,  a_hi  = pack["alpha_range"]
+
+    bx_vals = _linspace_centers(bx_lo, bx_hi, nbx)
+    by_vals = _linspace_centers(by_lo, by_hi, nby)
+    a_vals  = _linspace_centers(a_lo,  a_hi,  na)
+    r_grid  = np.sqrt(bx_vals[:, None]**2 + by_vals[None, :]**2)
+
+    a_mask = (a_vals >= a_min) & (a_vals <= a_max)
+    if not a_mask.any():
+        a_mask[:] = True
+
+    def _z_to_idx(z):
+        if nz <= 1: return 0
+        t = (z - z_lo) / max(z_hi - z_lo, 1e-12)
+        return int(np.clip(round(t * (nz - 1)), 0, nz - 1))
+
+    r_max_list, z_used = [], []
+    z_axis_vals = _linspace_centers(z_lo, z_hi, nz)
+    for z in z_samples:
+        zc = float(np.clip(z, z_lo, z_hi))
+        iz = _z_to_idx(zc)
+        occ_xy = (G[:, :, iz, a_mask] > 0).any(axis=2)  # (nbx, nby)
+        r_max = float(r_grid[occ_xy].max()) if occ_xy.any() else 0.0
+        r_max_list.append(r_max)
+        z_used.append(z_axis_vals[iz])
+    return np.array(r_max_list, float), np.array(z_used, float)
+
+def _build_boundary_ring_markers(pack,
+                                 z_min, z_max,
+                                 slices=8, phis=128, radius=0.006,
+                                 a_min=0.0, a_max=math.pi):
+    """
+    Build lightweight ring markers: list of ("sphere", pos, rgba, size)
+    drawing a circle at each z slice with radius = max reachable r at that z.
+    """
+    z0, z1 = pack["z_range"]
+    z_min = float(np.clip(z_min, z0, z1))
+    z_max = float(np.clip(z_max, z0, z1))
+    if z_max < z_min: z_min, z_max = z_max, z_min
+
+    z_samples = np.linspace(z_min, z_max, max(1, int(slices)))
+    r_max, z_used = _rm4d_envelope_rmax_per_z(pack, z_samples, a_min, a_max)
+
+    markers = []
+    phis = max(8, int(phis))
+    phi_vals = np.linspace(0.0, 2.0 * math.pi, phis, endpoint=False)
+
+    for zi, (z, r) in enumerate(zip(z_used, r_max)):
+        if r <= 0.0:  # nothing reachable at this z
+            continue
+        t = 0.25 + 0.6 * (zi / max(1, len(z_used) - 1))  # color gradient by slice
+        rgba = np.array([1.0, t, 0.0, 0.9], float)
+        for phi in phi_vals:
+            p = np.array([r * math.cos(phi), r * math.sin(phi), z], float)
+            markers.append(("sphere", p, rgba, np.array([radius, 0.0, 0.0], float)))
+    return markers
+
+def _draw_markers_to_user_scn(v, markers):
+    scn = v.user_scn
+    scn.ngeom = 0
+    I = min(len(markers), scn.maxgeom)
+
+    ident9 = np.eye(3, dtype=np.float64).reshape(9)  # flat 3x3
+
+    for k in range(I):
+        _, pos, rgba, size = markers[k]
+        size64 = np.asarray(size, dtype=np.float64).reshape(3,)
+        pos64  = np.asarray(pos,  dtype=np.float64).reshape(3,)
+        rgba32 = np.asarray(rgba, dtype=np.float32).reshape(4,)
+
+        g = scn.geoms[scn.ngeom]
+        mujoco.mjv_initGeom(
+            g,
+            mujoco.mjtGeom.mjGEOM_SPHERE,
+            size64,
+            pos64,
+            ident9,
+            rgba32
+        )
+        scn.ngeom += 1
+    return I
+
+
+# ----------------------------------------------
 
 # -------------------------- Main --------------------------
 
@@ -292,6 +453,18 @@ def main():
                         help='Where to place the OBJECT FRAME (pc centroid) in world (x y z).')
     parser.add_argument('--move_duration', type=float, default=2.0,
                         help='Seconds for smooth joint-space motion after IK solves.')
+    # for RM4D viz
+    parser.add_argument('--rm4d_path', type=str, default='rm4d_franka.pt')
+    parser.add_argument('--rm4d_boundary_slices', type=int, default=8,
+                        help='How many z-level rings to draw')
+    parser.add_argument('--rm4d_boundary_phis', type=int, default=128,
+                        help='Points per ring on each slice')
+    parser.add_argument('--rm4d_boundary_radius', type=float, default=0.006,
+                        help='Sphere size for ring points')
+    parser.add_argument('--rm4d_alpha_min', type=float, default=0.0)
+    parser.add_argument('--rm4d_alpha_max', type=float, default=math.pi)
+    parser.add_argument('--rm4d_z_min', type=float, default=0.0)
+    parser.add_argument('--rm4d_z_max', type=float, default=1.20)
     
     args = parser.parse_args()
     # Load cfg & model
@@ -303,6 +476,9 @@ def main():
     set_seeds(cfg.get('seed', 1))
 
     model = get_model(cfg.model).to(cfg.device)
+    rm4d_load(args.rm4d_path, device=cfg.device)
+    rm4d_pack_viz = torch.load(args.rm4d_path, map_location='cpu')
+
 
     # ---- Mesh & point cloud (correct scaling) ----
     obj_path, obj_tensor, mesh_raw, pc_center_raw = get_single_pcd(args.obj_type, scale=args.pc_scale)
@@ -552,11 +728,14 @@ def main():
     # ----- Make a energy_cost function.... which penalizes non-feasible grasps -----
     s_total = mesh_scale_factor * float(args.pc_scale)  # == 0.2 / max(size_raw) * pc_scale
 
-    energy_cost = init_energy_cost_irn(
-        ckpt_path="checkpoints/reach_irn.pt",
-        cfg_device=cfg.device,
-        base_pos_xyz=base_pos,
-        s_total=s_total
+    # Create RM4D-backed energy that reads the *current* object pose each call
+    global energy_cost
+    energy_cost = EnergyCostRM4D(
+        device=cfg.device,
+        s_total=s_total,
+        m=m, d=d,
+        obj_body=obj_body,
+        rm4d_energy_fn=_energy_cost_world  # from energy_cost_rm4d import ... as _energy_cost_world
     )
 
     # ---- SPACE: compute TCP from predicted object-centered grasp & move ----
@@ -622,9 +801,12 @@ def main():
     # ---- Viewer + keyboard ----
     running = True
     paused = False
-   
+    # ---- RM4D viz toggle state ----
+    rm4d_show = False
+    rm4d_markers = None   # cached list of markers when enabled
+
     def on_key(keycode):
-        nonlocal running, paused
+        nonlocal running, paused, rm4d_show, rm4d_markers
         try:
             ch = chr(keycode)
         except ValueError:
@@ -633,6 +815,19 @@ def main():
             move_to_grasp_once(args.guide_type)
         elif ch in ('p', 'P'):
             paused = not paused
+        elif ch in ('o', 'O'):
+            rm4d_show = not rm4d_show
+            rm4d_markers = _build_boundary_ring_markers(
+                            rm4d_pack_viz,
+                            z_min=args.rm4d_z_min, z_max=args.rm4d_z_max,
+                            slices=args.rm4d_boundary_slices,
+                            phis=args.rm4d_boundary_phis,
+                            radius=args.rm4d_boundary_radius,
+                            a_min=args.rm4d_alpha_min, a_max=args.rm4d_alpha_max
+                        )
+            print(f"[RM4D BOUNDARY] built {len(rm4d_markers)} points "
+                    f"({args.rm4d_boundary_slices} slices × {args.rm4d_boundary_phis} pts)")
+            print(f"[RM4D BOUNDARY] {'ENABLED' if rm4d_show else 'DISABLED'}")
         elif ch in ('q', 'Q', '\x1b'):  # q or ESC
             running = False
 
@@ -708,6 +903,8 @@ def main():
             # keep showing the desired (target) EEF pose until next SPACE updates it
             if desired_target["has"]:
                 set_tcp_target_marker(desired_target["p"], desired_target["q"])
+            if rm4d_show and rm4d_markers:
+                _draw_markers_to_user_scn(v, rm4d_markers)
             else:
                 v.user_scn.ngeom = 0
 

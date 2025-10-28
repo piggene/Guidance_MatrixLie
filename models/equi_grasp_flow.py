@@ -124,9 +124,6 @@ class EquiGraspFlow(torch.nn.Module):
             g_t = torch.zeros_like(v_t)
         else:   
             raise ValueError('Unknown guide type')
-        norms = torch.linalg.vector_norm(g_t, dim=1, keepdim=True)  # (N, 1) L2 norms
-        mean_norm = norms.mean()    
-        print(f"Mean norm of g_t: {mean_norm.item()}")
         v_t = v_t + g_t
         return v_t
     
@@ -283,6 +280,7 @@ class EquiGraspFlow(torch.nn.Module):
         log_D  = math.log(D)
         x_1_sim, u_t = get_final(x_t, t, x_0) #N,D,4,4 / N,D,6
         J = self.J(x_1_sim)
+        print(J.mean().item()/1000)
         log_Z = torch.logsumexp(-J, dim=1) - log_D 
         alpha = torch.exp(-J - log_Z.unsqueeze(1)) - 1                                    
         g_t = (alpha * u_t).mean(dim=1) 
@@ -423,7 +421,7 @@ class EquiGraspFlow(torch.nn.Module):
     #     return penalty.unsqueeze(-1)            # (..., 1)
 
 
-    # # Alternative J function: cubic penalty for deviation from target x0    
+    #Alternative J function: cubic penalty for deviation from target x0    
     # def J(self, x, x0=0.1):
     #     """
     #     Penalize deviation of the grasp x-position from x0.
@@ -485,6 +483,7 @@ class EquiGraspFlow(torch.nn.Module):
         if not callable(energy_cost):
             raise TypeError("fn must be callable")
         self.J = energy_cost
+        #None for x_1 since we use cached x_1 inside guided_vector_field_with_guidance
         x_1_ = self.ode_solver(z, x_0, None, self.guided_vector_field_with_guidance)[:, -1]
         return x_1_
 
