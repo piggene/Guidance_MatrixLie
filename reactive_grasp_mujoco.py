@@ -89,7 +89,7 @@ def get_single_pcd(obj_type: str,
     return mesh_path, pc_tensor, mesh_raw, pc_center_raw
 
 
-def get_grasp_pose(model, obj, device, guide_type):
+def get_grasp_pose(model, obj, device, guide_type, energy_cost):
     model.eval()
     with torch.no_grad():
         obj = obj.to(device)
@@ -202,6 +202,56 @@ def ik_step_to_pose(m, d, ee_body_id, arm_joint_ids, p_target, q_target_wxyz,
     # return norms for convergence checks
     return float(np.linalg.norm(pos_err)), float(np.linalg.norm(rot_err))
 
+# ---------- Training-accurate IK evaluator (exactly as in reach_gen_train_irn.py) ----------
+class IKEval:
+    def __init__(self, m, d, ee, arm, pos_tol=7e-4, rot_tol=6e-3, max_iters=800):
+        self.m, self.d, self.ee, self.arm = m, d, ee, arm
+        self.pos_tol, self.rot_tol = pos_tol, rot_tol
+        self.max_iters = max_iters
+
+    def plan(self, T, step_gain=0.55, lam=LAM_BASE, z_floor=0.03):
+        R = T[:3, :3]
+        p = T[:3, 3].copy()
+        p[2] = max(p[2], z_floor)
+        q = np.empty(4); mujoco.mju_mat2Quat(q, R.flatten())
+
+        # scratch copy of data (same as training)
+        di = mujoco.MjData(self.m)
+        di.qpos[:] = self.d.qpos
+        di.qvel[:] = self.d.qvel
+        mujoco.mj_forward(self.m, di)
+
+        for _ in range(self.max_iters):
+            pe, re = ik_step_to_pose(self.m, di, self.ee, self.arm, p, q,
+                                     step_gain=step_gain, lam=lam)
+            if pe < self.pos_tol and re < self.rot_tol:
+                qg = get_arm_qpos(self.m, di, self.arm)
+                return True, qg
+        # failed plan → return current arm qpos as fallback (same as training)
+        return False, get_arm_qpos(self.m, self.d, self.arm)
+
+    # def short_traj_safe(self, q_goal, steps=24):
+    #     q0 = get_arm_qpos(self.m, self.d, self.arm)
+    #     for s in np.linspace(0, 1, steps):
+    #         q = (1 - s) * q0 + s * q_goal
+    #         di = mujoco.MjData(self.m)
+    #         di.qpos[:] = self.d.qpos
+    #         for j, qj in zip(self.arm, q):
+    #             adr = self.m.jnt_qposadr[j]
+    #             if self.m.jnt_limited[j]:
+    #                 lo, hi = self.m.jnt_range[j]
+    #                 if qj < lo - 1e-4 or qj > hi + 1e-4:
+    #                     return False
+    #                 di.qpos[adr] = np.clip(qj, lo, hi)
+    #             else:
+    #                 di.qpos[adr] = qj
+    #         mujoco.mj_forward(self.m, di)
+    #     return True
+
+
+
+
+
 # ---------- Scene build (include + markers) ----------
 
 def build_mujoco_scene_with_include(
@@ -242,7 +292,7 @@ def build_mujoco_scene_with_include(
     <geom name="floor" type="plane" size="2 2 0.1" rgba="0.2 0.2 0.2 1"/>
 
     <!-- Body origin IS the object's learned frame (pc centroid). -->
-    <body name="object" pos="{base_pos_xyz[0]} {base_pos_xyz[1]} {base_pos_xyz[2]}">
+    <body name="object" pos="{base_pos_xyz[0]} {base_pos_xyz[1]} {base_pos_xyz[2]}" mocap="true">
       <geom type="mesh" mesh="obj_mesh" pos="{gx} {gy} {gz}"
             rgba="0.9 0.9 0.9 1" contype="0" conaffinity="0"/>
     </body>
@@ -283,15 +333,17 @@ def main():
     parser.add_argument('--train_result_path', type=str, required=True)
     parser.add_argument('--checkpoint', type=str, required=True)
     parser.add_argument('--guide_type', type=str, default='none')
-    parser.add_argument('--device', default='1')  # 'cpu' or CUDA index string
+    parser.add_argument('--device', default='0')  # 'cpu' or CUDA index string
     parser.add_argument('--obj_type', default='Mug')
     parser.add_argument('--panda_xml', type=str, default='franka_emika_panda/panda.xml')
     parser.add_argument('--pc_scale', type=float, default=8.0, help='Must match your training/data')
     parser.add_argument('--hz', type=int, default=240)
-    parser.add_argument('--obj_center', type=float, nargs=3, default=[0.5, 0.7, 0.5],
+    parser.add_argument('--obj_center', type=float, nargs=3, default=[0.4, 0.4, 0.5],
                         help='Where to place the OBJECT FRAME (pc centroid) in world (x y z).')
     parser.add_argument('--move_duration', type=float, default=2.0,
                         help='Seconds for smooth joint-space motion after IK solves.')
+    parser.add_argument('--distance', action='store_true',
+                        help='If set, energy cost considers distance efficiency along with reachability.')
     
     args = parser.parse_args()
     # Load cfg & model
@@ -382,7 +434,6 @@ def main():
         if jid >= 0:
             d.qpos[m.jnt_qposadr[jid]] = val
 
-    mujoco.mj_forward(m, d)
 
     # --- actuators → PD setpoints helpers ---
     arm_actuator_ids = []
@@ -435,8 +486,11 @@ def main():
 
     ee_body = _find_body(["panda_hand", "panda_link7", "hand", "link7"])
     obj_body = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "object")
-
+    ike_train = IKEval(m, d, ee_body, arm_joint_ids,
+                   pos_tol=7e-4, rot_tol=6e-3, max_iters=800)
     # ---- mocap ids for markers ----
+    # mocap id for the object (now mocap-controlled)
+    
     def _mocap_id(body_name):
         bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, body_name)
         if bid < 0: return -1
@@ -446,10 +500,101 @@ def main():
     tcp_reached_mocapid = _mocap_id("tcp_reached")
     assert tcp_target_mocapid  != -1, "tcp_target mocap body not found"
     assert tcp_reached_mocapid != -1, "tcp_reached mocap body not found"
+    obj_mocap = _mocap_id("object")
+    assert obj_mocap != -1, "object mocap body not found"
+
+    # set initial mocap pose to match the starting base_pos / identity rotation
+    d.mocap_pos[obj_mocap]  = np.asarray(base_pos, dtype=float)
+    d.mocap_quat[obj_mocap] = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+    mujoco.mj_forward(m, d)
+
+    def _object_T_world_np():
+        """Return 4x4 SE(3) of the object mocap body in WORLD frame (NumPy)."""
+        p = d.mocap_pos[obj_mocap].copy()    # (3,)
+        q = d.mocap_quat[obj_mocap].copy()   # (w, x, y, z)
+        Rflat = np.empty(9, dtype=float)
+        mujoco.mju_quat2Mat(Rflat, q)        # fills row-major 3x3 into Rflat
+        R = Rflat.reshape(3, 3)
+        T = np.eye(4, dtype=float)
+        T[:3, :3] = R
+        T[:3,  3] = p
+        return T
+
+    def _refresh_energy_cost_from_object_pose(distance = False, current_pos = None):
+        """Rebuild energy_cost so compose() uses the latest object world pose."""
+        nonlocal energy_cost
+        Tnp = _object_T_world_np()
+        Ttorch = torch.tensor(Tnp, dtype=torch.float32, device=cfg.device)
+        energy_cost = init_energy_cost_irn(
+            ckpt_path="checkpoints/reach_irn.pt",
+            cfg_device=cfg.device,
+            s_total=s_total,
+            base_pos=Ttorch,   # pass FULL 4x4 world pose of the object
+            distance = distance,
+            current_pos = current_pos,
+        )
 
     def set_marker(mocapid, p_world, q_wxyz):
         d.mocap_pos[mocapid]  = np.asarray(p_world, dtype=float)
         d.mocap_quat[mocapid] = np.asarray(q_wxyz, dtype=float)
+        
+    # Define the random range (tweak as you like)
+    # --- Cylindrical-space sampling for the object pose ---
+    # r in meters, theta/yaw in radians, z in meters
+    CYL_RANGE = {
+        "r":     (0.32, 0.70),            # radial distance from base origin
+        "theta": (np.deg2rad(-90), np.deg2rad(90)),   # polar angle in base XY
+        "z":     (0.23, 0.45),            # height
+        "yaw":   (np.deg2rad(-180), np.deg2rad(180)), # object spin about +Z
+    }
+    BASE_ORIGIN = np.array([0.0, 0.0, 0.0], dtype=float)  # change if your base frame differs
+
+    def _rand_in(a, b):  # uniform
+        return float(a + (b - a) * random.random())
+
+    def _Rz(yaw):
+        c, s = math.cos(yaw), math.sin(yaw)
+        return np.array([[c,-s,0.0],
+                        [s, c,0.0],
+                        [0.0,0.0,1.0]], dtype=float)
+
+    def _yaw_to_quat(yaw):
+        # quaternion (w, x, y, z) for rotation about +Z by yaw
+        half = 0.5 * yaw
+        return np.array([math.cos(half), 0.0, 0.0, math.sin(half)], dtype=float)
+
+    # current cylindrical/yaw state (kept in sync with the mocap)
+    _cyl_state = {"r": None, "theta": None, "z": None, "yaw": 0.0}
+
+    def _sample_cyl_pose():
+        r     = _rand_in(*CYL_RANGE["r"])
+        theta = _rand_in(*CYL_RANGE["theta"])
+        z     = _rand_in(*CYL_RANGE["z"])
+        yaw   = _rand_in(*CYL_RANGE["yaw"])
+        return r, theta, z, yaw
+
+    def _cyl_to_cart(r, theta, z):
+        x = BASE_ORIGIN[0] + r * math.cos(theta)
+        y = BASE_ORIGIN[1] + r * math.sin(theta)
+        return np.array([x, y, z], dtype=float)
+
+    def move_object_cyl(r, theta, z, yaw):
+        """Move object in cylindrical coords and update energy mapper."""
+        p_world = _cyl_to_cart(r, theta, z)
+        d.mocap_pos[obj_mocap]  = p_world
+        d.mocap_quat[obj_mocap] = _yaw_to_quat(yaw)
+        mujoco.mj_forward(m, d)
+
+        # keep ‘energy_cost’ translation aligned (its compose() handles scale + translation);
+        # rotation will be injected when composing the grasp (see below).
+        nonlocal base_pos
+        base_pos = p_world.copy()
+        _cyl_state.update({"r": r, "theta": theta, "z": z, "yaw": yaw})
+        print(f"[OBJECT] r={r:.3f} θ={math.degrees(theta):.1f}° z={z:.3f} yaw={math.degrees(yaw):.1f}°  →  {p_world}")
+
+    def randomize_object_pose_cyl():
+        r, th, z, yaw = _sample_cyl_pose()
+        move_object_cyl(r, th, z, yaw)
 
     # --------- IK planning on a scratch copy (no visual warp) ----------
     def plan_ik_joint_goal(T_world_TCP, max_iters=10000, step_gain=0.55, lam=LAM_BASE,
@@ -552,22 +697,18 @@ def main():
     # ----- Make a energy_cost function.... which penalizes non-feasible grasps -----
     s_total = mesh_scale_factor * float(args.pc_scale)  # == 0.2 / max(size_raw) * pc_scale
 
-    energy_cost = init_energy_cost_irn(
-        ckpt_path="checkpoints/reach_irn.pt",
-        cfg_device=cfg.device,
-        base_pos_xyz=base_pos,
-        s_total=s_total
-    )
-
+    energy_cost = None
+    _refresh_energy_cost_from_object_pose()
+    
     # ---- SPACE: compute TCP from predicted object-centered grasp & move ----
     def move_to_grasp_once(guide_type):
         # (A) model grasp in object frame (torch 4x4 on device)
-        T_obj_TCP = get_grasp_pose(model, obj_tensor, cfg.device, guide_type)
-        print(f"Energy at predicted grasp: {energy_cost(T_obj_TCP).item():.4f}")
+        T_obj_TCP = get_grasp_pose(model, obj_tensor, cfg.device, guide_type, energy_cost)
         if T_obj_TCP.ndim == 3 and T_obj_TCP.shape[0] == 1:
             T_obj_TCP = T_obj_TCP[0]
         assert T_obj_TCP.shape == (4, 4)
-
+        print(f"Energy at predicted grasp: {energy_cost(T_obj_TCP).item():.4f}")
+        
         # (B) compose to WORLD using the *same* logic as energy_cost
         T_world_TCP = energy_cost.compose(T_obj_TCP)  # (4,4) torch on device
 
@@ -579,6 +720,9 @@ def main():
         R = Tnp[:3, :3]
         p = Tnp[:3, 3].copy()
         q_wxyz = np.empty(4); mujoco.mju_mat2Quat(q_wxyz, R.flatten())
+        x, y, z = Tnp[:3, 3]
+        if not (0.04 <= x**2 + y**2 <= 0.81 and 0.05 <= z <= 0.9):
+            print(f"[WARN] out-of-distribution pose for IRN/IK: ({x:.3f},{y:.3f},{z:.3f})")
 
         set_tcp_target_marker(p, q_wxyz)
         desired_target["has"] = True
@@ -587,17 +731,29 @@ def main():
         # ======= ADD inside move_to_grasp_once(...) after desired_target[...] is set =======
         _goal_ctx["tcp_p"] = p.copy()
         _goal_ctx["tcp_q"] = q_wxyz.copy()
+            
+        ok, q_goal = ike_train.plan(Tnp, step_gain=0.55, lam=LAM_BASE, z_floor=0.03)
+        reachable = bool(ok)
 
+        print(f"[IK label (offline)] reachable={ok}")
 
-        # (D) plan IK and schedule smooth motion (non-blocking)
-        solved = move_panda_tcp_to_SE3(
-            T_world_TCP, duration=args.move_duration,
-            step_gain=0.55, lam=LAM_BASE
-        )
-        if solved:
-            print("[SPACE ✅] IK solved; smooth motion scheduled.")
-        else:
-            print("[SPACE ❌] Grasp pose not feasible.")
+        if not reachable:
+            print("[SKIP] Training-consistent IK says UNREACHABLE.")
+            label_start("Unreachable", duration=2.0)
+            return
+
+        # If reachable by training definition, execute that *same* goal
+        label_clear() 
+        print("[IK ✅] Training-consistent IK solved. Starting smooth joint motion...")
+        start_joint_traj(q_goal, args.move_duration)
+     
+    def move_to_start_pose(m, d, arm_joint_ids, home_q):
+        print("[INFO] Moving to home pose...")
+        start_joint_traj(home_q, 2.0)
+        desired_target["has"] = False
+        # ======= ADD inside move_to_start_pose(...) =======
+        _goal_ctx["tcp_p"] = None
+        _goal_ctx["tcp_q"] = None        
             
     # ======= ADD: diagnostics helpers =======
 
@@ -630,21 +786,83 @@ def main():
         except ValueError:
             ch = ''
         if ch == ' ':
+            label_clear()
+            if args.distance:
+                p_cur, _ = _tcp_from_state(m, d, ee_body)
+                print(f"[REFRESH] energy cost with current TCP at {p_cur}")
+                _refresh_energy_cost_from_object_pose(distance=True, current_pos=p_cur)
             move_to_grasp_once(args.guide_type)
         elif ch in ('p', 'P'):
             paused = not paused
+        elif ch in ('/', '?'):
+            randomize_object_pose_cyl()
+            if args.distance:
+                p_cur, _ = _tcp_from_state(m, d, ee_body)
+                print(f"[REFRESH] energy cost with current TCP at {p_cur}")
+                _refresh_energy_cost_from_object_pose(distance=True, current_pos=p_cur)
+            else:
+                _refresh_energy_cost_from_object_pose()
+        elif ch in ('r', 'R'):
+            move_to_start_pose(m, d, arm_joint_ids, home_q)
         elif ch in ('q', 'Q', '\x1b'):  # q or ESC
             running = False
 
 
-    
-    with viewer.launch_passive(m, d, key_callback=on_key) as v:
-        v.cam.lookat[:] = (0.0, 0.0, 0.05)
-        v.cam.distance = 1.2
-        v.cam.azimuth = 60
-        v.cam.elevation = -25
 
-        dt = 1.0 / float(args.hz)
+    with viewer.launch_passive(m, d, key_callback=on_key) as v:
+        v.cam.lookat[:] = (0.0, 0.0, 0.2)
+        v.cam.distance   = 2.57293606605
+        v.cam.azimuth    = -135.0
+        v.cam.elevation  = -44.39410821999
+        
+        _label = {
+            "idx": -1,           # reserved user_scn slot (once)
+            "text": "",          # current message
+            "t_end": 0.0,        # sim time when it should disappear
+        }
+
+        # pre-alloc constants to avoid per-frame allocations
+        _LABEL_ZERO = np.zeros(3, dtype=float)
+        _LABEL_RMAT = np.eye(3, dtype=float).ravel()
+        _LABEL_RGBA_ON  = np.array([1, 1, 1, 1], dtype=float)
+        _LABEL_RGBA_OFF = np.array([1, 1, 1, 0], dtype=float)
+
+        def label_start(msg: str, duration: float = 2.0):
+            _label["text"] = str(msg)
+            _label["t_end"] = float(d.time) + float(duration)
+
+        def label_clear():
+            _label["text"] = ""
+            _label["t_end"] = 0.0
+
+        def label_draw(v, pos_world):
+            """Draw/Hide the single label in-place without growing ngeom."""
+            # reserve exactly one slot once
+            scn = v.user_scn
+            if _label["idx"] < 0:
+                if scn.ngeom >= scn.maxgeom:
+                    return  # nothing we can do
+                _label["idx"] = scn.ngeom
+                scn.ngeom += 1
+
+            # if someone reset ngeom (e.g. your code sets to 0), restore so our slot exists
+            if scn.ngeom <= _label["idx"]:
+                scn.ngeom = _label["idx"] + 1
+
+            active = _label["text"] and (float(d.time) <= _label["t_end"])
+
+            gref = scn.geoms[_label["idx"]]
+            mujoco.mjv_initGeom(
+                gref,
+                mujoco.mjtGeom.mjGEOM_LABEL,
+                _LABEL_ZERO,
+                np.asarray(pos_world, dtype=float),
+                _LABEL_RMAT,
+                _LABEL_RGBA_ON if active else _LABEL_RGBA_OFF,
+            )
+            gref.label = _label["text"] if active else ""
+
+        dt = 1.0 / 500
         while v.is_running() and running:
             # ---- advance scheduled joint-space trajectory (min-jerk) ----
             if active_traj["on"]:
@@ -708,9 +926,10 @@ def main():
             # keep showing the desired (target) EEF pose until next SPACE updates it
             if desired_target["has"]:
                 set_tcp_target_marker(desired_target["p"], desired_target["q"])
+                label_draw(v, desired_target["p"])
             else:
-                v.user_scn.ngeom = 0
-
+                v.user_scn.ngeom = 0            
+                
             v.sync()
             time.sleep(dt)
 

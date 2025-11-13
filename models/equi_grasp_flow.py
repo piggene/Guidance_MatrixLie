@@ -16,8 +16,6 @@ class EquiGraspFlow(torch.nn.Module):
         self.encoder = encoder
         self.vector_field = vector_field
         self.ode_solver = ode_solver
-      
-
 
     def step(self, data, losses, split, optimizer=None):
         # Get data
@@ -35,6 +33,11 @@ class EquiGraspFlow(torch.nn.Module):
 
         # Get x_t and u_t
         x_t, u_t = get_traj(x_0, x_1, t)
+        
+        # u_t -> 3 so(3) so(3) ->  R_0  tangent vector 
+        # v_t -> x_t 의 rotation part : R_t   tangent vector
+        # 둘이 다른 frame.. v_t & u_t but doesnt matter since they are identical when following constant vector 
+        # network ouput : R_t tangent vector (so(3)-> R_t pullback) + R^3 velocity (even in integration SE(3) SO3 X R^3)
 
         # Forward
         v_t = self(pc, t, x_t, nums_grasps)
@@ -111,19 +114,23 @@ class EquiGraspFlow(torch.nn.Module):
         # print(t.shape) #[N, 1]
         # print(x_t.shape) #[N,4,4]
         self.guidance = 2
-        D = x_1.shape[0] if x_1 is not None else 100
+        D = x_1.shape[0] if x_1 is not None else 10000
         v_t = (1 - self.guidance) * self.vector_field(torch.zeros_like(z), t, x_t) + self.guidance * self.vector_field(z, t, x_t)
+        # print(f"ang vel norm v_t: {v_t[:,0:3].norm(dim=-1).mean()}, pos vel norm v_t: {v_t[:,3:].norm(dim=-1).mean()}")
         # print(x_t[:,0,3].mean())
         if self.guide_type == 'mc':
             g_t =  self.guidance_vector_MC(x_1,t,x_t)
         elif self.guide_type == 'sim':
-            g_t =  self.guidance_vector_sim_MC(D,t,x_t)
+            g_t =  self.guidance_vector_sim_MC(D,t,x_t) # Now scheduling g_t requires.. 6 constant works just fine..
         elif self.guide_type == 'grad':
             g_t = self.guidance_vector_grad(t,x_t,v_t)
         elif self.guide_type == 'none':
             g_t = torch.zeros_like(v_t)
+        elif self.guide_type == 'reject':
+            g_t = torch.zeros_like(v_t)
         else:   
             raise ValueError('Unknown guide type')
+        # print(f"ang vel norm g_t: {g_t[:,0:3].norm(dim=-1).mean()}, pos vel norm g_t: {g_t[:,3:].norm(dim=-1).mean()}")
         v_t = v_t + g_t
         return v_t
     
@@ -225,18 +232,6 @@ class EquiGraspFlow(torch.nn.Module):
         sigma_v = 0.1
         inv_sw2 = 1.0 / (sigma_w * sigma_w)
         inv_sv2 = 1.0 / (sigma_v * sigma_v)
-
-        #TODO could vuz some istability...
-        # log_p_xt_z = -0.5 * (w.square().sum(-1) * inv_sw2 + v.square().sum(-1) * inv_sv2)  # (N,D)
-        # log_p_xt   = torch.logsumexp(log_p_xt_z, dim=1) - log_D                             # (N,)
-        # weights    = torch.exp(log_p_xt_z - log_p_xt.unsqueeze(1))                          # (N,D)
-
-        # J = C["J_x1"]                                                                       # (1,D)
-
-        # log_Z = torch.logsumexp(log_p_xt_z - log_p_xt.unsqueeze(1) - J, dim=1) - log_D      # (N,)
-        # alpha = torch.exp(-J - log_Z.unsqueeze(1)) - 1                                       # (N,D)
-
-        # g_t = ((alpha * weights).unsqueeze(-1) * u_t).mean(dim=1)                            # (N,6)
         
         log_p_xt_z = -0.5 * (w.square().sum(-1) * inv_sw2 + v.square().sum(-1) * inv_sv2)  # (N,D)
 
@@ -278,13 +273,31 @@ class EquiGraspFlow(torch.nn.Module):
         # print(x_t.shape) #[N,4,4]
         x_0 = self.init_dist(D, x_t.device)
         log_D  = math.log(D)
-        x_1_sim, u_t = get_final(x_t, t, x_0) #N,D,4,4 / N,D,6
+        # x_1_sim, u_t = get_final(x_t, t, x_0) #N,D,4,4 / N,D,6
+        x_1_sim, u_t = get_final2(x_t, t, x_0) #N,D,4,4 / N,D,6
+        
+        # Pullback so(3) to R_t (current return of u_t's rotation part is so(3))
+        R_t = x_t[..., :3, :3]           # (N,3,3)
+        w_b = u_t[..., :3]               # (N,D,3)
+        w_s = torch.einsum('nij,ndj->ndi', R_t, w_b)  # (N,D,3)
+        u_t[..., :3] = w_s
+        
         J = self.J(x_1_sim)
-        print(J.mean().item()/1000)
+        # print(f"J mean of estimated sim x_1: {J.mean().item()}")
         log_Z = torch.logsumexp(-J, dim=1) - log_D 
         alpha = torch.exp(-J - log_Z.unsqueeze(1)) - 1                                    
         g_t = (alpha * u_t).mean(dim=1) 
-        return g_t  
+        
+        #Heuristic scaling
+        # target = 3 #TODO.. .change this value based on desired guidance strength (3.0 works for sim with negative pose only cost)
+        # eps = 1e-12
+        # scale = target / g_t[:,3:].norm(dim=-1, keepdim=True).clamp_min(eps)  # [N,1]
+        # g_t[:,3:] = g_t[:,3:] * scale                                               # [N,6]
+        # ang_target = 1+t #TODO.. .change this value based on desired guidance strength (3.0 works for sim with negative pose only cost)
+        # scale = ang_target / g_t[:,:3].norm(dim=-1, keepdim=True).clamp_min(eps)  # [N,1]
+        # g_t[:,:3] = g_t[:,:3] * scale     
+        g_t = g_t * 3.0             
+        return g_t  #[N,6]
 
 
     def left_triv_grad_from_matrix_grad_SE3(self, X, dJ_dX, alpha=1.0, beta=1.0, M=None, M_inv=None):
@@ -419,6 +432,30 @@ class EquiGraspFlow(torch.nn.Module):
     #         torch.zeros_like(t[..., 0])         # zero for x <= 0
     #     )
     #     return penalty.unsqueeze(-1)            # (..., 1)
+    
+    # def J(self, x):
+    #     '''
+    #     Penalizes grasp pose that is not orthogonal to the table plane (XY plane).
+    #     Input: 
+    #         x: (..., 4, 4) SE(3) transforms. Supports (D,4,4) or (N,D,4,4).
+    #     Return:
+    #         (..., 1) penalty. (D,1) if input is (D,4,4); (N,D,1) if (N,D,4,4).
+    #     '''
+        
+    #     # rotation matrix
+    #     R = x[..., :3, :3]  # (..., 3, 3)   
+    #     # desired approach direction (negative Z axis)
+    #     desired_dir = torch.tensor([0, 0, -1], dtype=R.dtype, device=R.device)  # (3,)
+    #     # actual approach direction (third column of R)
+    #     actual_dir = R[..., :, 2]  # (..., 3)
+    #     # cosine of angle between actual and desired direction
+    #     cos_theta = torch.clamp(torch.sum(actual_dir * desired_dir, dim=-1), -1.0, 1.0)  # (...)
+    #     # angle in radians
+    #     theta = torch.acos(cos_theta)  # (...)
+    #     # penalty: square of the angle (larger penalty for larger deviation)
+    #     penalty = (theta / (math.pi )).pow(3) * 500.0  # scale penalty to [0, 50]
+    #     return penalty.unsqueeze(-1)  # (..., 1)
+        
 
 
     #Alternative J function: cubic penalty for deviation from target x0    
@@ -451,7 +488,7 @@ class EquiGraspFlow(torch.nn.Module):
 
 
     def guided_sample(self, pc, grasp_pose, Num_Grasp, guide_type):
-        #Run guided-sampliNum_Grasp
+        #Run guided-sampling 
         x_1_hat_rot = torch.zeros((len(pc), Num_Grasp, 4, 4), device=pc.device)
         self.guide_type = guide_type
         for k, (mesh, grasp) in enumerate(zip(pc, grasp_pose)):
@@ -469,6 +506,24 @@ class EquiGraspFlow(torch.nn.Module):
             self.X0SAMPLED = deepcopy(x_0)
             # Push-forward initial samples
             x_1_hat = self.ode_solver(z, x_0, x_1, self.guided_vector_field_with_guidance)[:, -1]
+
+            # print(f"J mean: {self.J(x_1_hat).mean().item()}")
+            
+            if guide_type == 'reject':
+                #Reject samples with high energy cost
+                J_vals = self.J(x_1_hat).squeeze(-1)  # shape: [Num_Grasp]
+                threshold = 10  # Set your desired threshold here
+                mask = J_vals < threshold
+                accepted_samples = x_1_hat[mask]
+                num_accepted = accepted_samples.shape[0]
+
+                if num_accepted >= Num_Grasp:
+                    x_1_hat = accepted_samples[:Num_Grasp]
+                else:
+                    # If not enough samples are accepted, fill the rest with NAN position samples
+                    num_needed = Num_Grasp - num_accepted
+                    nan_samples = torch.full((num_needed, 4, 4), float('nan'), device=x_1_hat.device)
+                    x_1_hat = torch.cat([accepted_samples, nan_samples], dim=0)
 
             # Batch x_1_hat
             # x_1_hat = x_1_hat.split(nums_grasps.tolist())
@@ -561,6 +616,7 @@ def get_traj2(x_0, x_1, t):
 def get_final(x_t, t, x_0):
     # Shapes
     # x_0: (D,4,4), x_t: (N,4,4), t: (N,)
+    #Returns so(3) X R^3 velocity of u_t and final pose x_1 at t=1 
     N, D = x_t.shape[0], x_0.shape[0]
     R0 = x_0[..., :3, :3]           # (D,3,3)
     Rt = x_t[..., :3, :3]           # (N,3,3)
@@ -570,14 +626,18 @@ def get_final(x_t, t, x_0):
     # rotations: log on pairwise R0^T @ Rt  → (N,D,3,3)
     dR = R0.transpose(-1, -2).unsqueeze(0) @ Rt.unsqueeze(1)          # (N,D,3,3)
     dR_log = log_SO3_fast(dR)                                         # (N,D,3,3)
-
     # geodesic step: scale the log by 1/t, then exp back and left-multiply by R0
-    a = (1.0 / t.view(N, 1, 1, 1)) * dR_log                           # (N,D,3,3)
+    # print(f"dR_log mean: {bracket_so3(dR_log).mean().item()}")
+    a = (1.0 / torch.max(t.view(N, 1, 1, 1), torch.tensor(0.025).to(t.device))) * dR_log                           # (N,D,3,3)
+    b = a.view(-1, 3, 3)
+    b = bracket_so3(b)
+    b = b.view(N, D, 3)
+    angles = b.norm(dim=-1)            # (N, D)
+    # print(f"angle mean (deg): {(angles.mean() * 180/math.pi).item():.4f}")
     R_1 = R0.unsqueeze(0) @ exp_so3_fast(a)                           # (N,D,3,3)
 
     # translations: linear interp per (N,D)
     p_1 = p0.unsqueeze(0) + (1.0 / (t.view(N, 1, 1)+0.025)) * (pt.unsqueeze(1) - p0.unsqueeze(0))  # (N,D,3)
-
     # build x_1
     x_1 = x_0.new_zeros((N, D, 4, 4))
     x_1[..., :3, :3] = R_1
@@ -589,10 +649,43 @@ def get_final(x_t, t, x_0):
     # log(R0^T @ R_1): (N,D,3,3) → bracket_so3_fast → (N,D,3)
     w_b = bracket_so3_fast(log_SO3_fast(R0.transpose(-1, -2).unsqueeze(0) @ R_1))  # (N,D,3)
     # rotate twists to space frame using R0 (D,3,3)
-    w_s = torch.einsum('dij,ndj->ndi', R0, w_b)                                      # (N,D,3)
+    # w_s = torch.einsum('dij,ndj->ndi', R0, w_b)                                      # (N,D,3)
 
     u_t = x_0.new_zeros((N, D, 6))
-    u_t[..., :3] = w_s
+    u_t[..., :3] = w_b
     u_t[..., 3:] = p_1 - p0.unsqueeze(0)                                            # (N,D,3)
+    
+    return x_1, u_t
 
+def get_final2(x_t, t, x_0):
+    # Shapes
+    # x_0: (D,4,4), x_t: (N,4,4), t: (N,)
+    #Returns so(3) X R^3 velocity of u_t and final pose x_1 at t=1 
+    N, D = x_t.shape[0], x_0.shape[0]
+    T0 = x_0[..., :4, :4]           # (D,4,4)
+    R0 = x_0[..., :3, :3]           # (D,3,3)
+    p0 = x_0[..., :3, 3]            # (D,3)
+    Tt = x_t[..., :4, :4]           # (N,3,3)
+    dT_log = log_SE3_fast(inv_SE3_fast(T0).unsqueeze(0) @ Tt.unsqueeze(1))  # (N,D,4,4)
+    # rotations: log on pairwise R0^T @ Rt  → (N,D,3,3)
+    a = (1.0 / torch.max(t.view(N, 1, 1, 1), torch.tensor(0.025).to(t.device))) * dT_log                           # (N,D,4,4)
+    T_1 = T0.unsqueeze(0) @ exp_se3_fast(a)                           # (N,D,4,4)
+
+    # translations: linear interp per (N,D)
+    p_1 = T_1[..., :3, 3]            # (D,3)
+    R_1 = T_1[..., :3, :3]           # (N,D,3,3)
+    x_1 = x_0.new_zeros((N, D, 4, 4))
+    x_1[..., :4, :4] = T_1
+
+
+    # body twist -> space twist
+    # log(R0^T @ R_1): (N,D,3,3) → bracket_so3_fast → (N,D,3)
+    w_b = bracket_so3_fast(log_SO3_fast(R0.transpose(-1, -2).unsqueeze(0) @ R_1))  # (N,D,3)
+    # rotate twists to space frame using R0 (D,3,3)
+    # w_s = torch.einsum('dij,ndj->ndi', R0, w_b)                                      # (N,D,3)
+
+    u_t = x_0.new_zeros((N, D, 6))
+    u_t[..., :3] = w_b
+    u_t[..., 3:] = p_1 - p0.unsqueeze(0)                                            # (N,D,3)
+    
     return x_1, u_t

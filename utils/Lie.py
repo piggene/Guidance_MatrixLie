@@ -417,6 +417,71 @@ def exp_so3_fast(w_mat):
         R[reg] = I + torch.sin(th) * wr + (1 - torch.cos(th)) * (wr @ wr)
     return R
 
+def exp_se3_fast(S):
+    """
+    Fast SE(3) exponential map.
+    Inputs:
+      - S: (...,6) twist [w_x, w_y, w_z, v_x, v_y, v_z]
+           or (...,4,4) se(3) matrix with [w]x in top-left and v in top-right.
+    Output:
+      - (...,4,4) SE(3) matrix
+    """
+    EPS_local = EPS  # use your global EPS
+
+    # --- Parse inputs into w_mat (...,3,3) and v (...,3) ---
+    if S.shape[-2:] == (4, 4):
+        batch_shape = S.shape[:-2]
+        device, dtype = S.device, S.dtype
+        w_mat = S[..., :3, :3]
+        v     = S[..., :3, 3]
+    else:
+        assert S.shape[-1] == 6, f"exp_se3_fast: expected (...,6) or (...,4,4), got {tuple(S.shape)}"
+        batch_shape = S.shape[:-1]
+        device, dtype = S.device, S.dtype
+        w_mat = bracket_so3_fast(S[..., :3])  # (...,3,3)
+        v     = S[..., 3:]                    # (...,3)
+
+    # --- Rotation ---
+    R = exp_so3_fast(w_mat)  # (...,3,3)
+
+    # --- Translation via V(θ) = I + B[ω]x + C[ω]x^2 ---
+    w_vec = bracket_so3_fast(w_mat)                      # (...,3)
+    theta = torch.linalg.norm(w_vec, dim=-1)             # (...)
+    th    = theta.unsqueeze(-1).unsqueeze(-1)            # (...,1,1)
+
+    Omega  = w_mat                                       # (...,3,3)
+    Omega2 = Omega @ Omega                               # (...,3,3)
+    I3     = torch.eye(3, device=device, dtype=dtype).expand(*Omega.shape)
+
+    # Stable coefficients for all theta (series near 0)
+    th2 = th * th
+    th4 = th2 * th2
+
+    # A, B, C are used only for V; we need B and C here
+    # Large-angle formulas
+    B_large = (1.0 - torch.cos(th)) / (th2 + EPS_local)
+    C_large = (th - torch.sin(th)) / (th * th2 + EPS_local)
+
+    # Small-angle Taylor expansions
+    B_small = 0.5 - th2/24.0 + th4/720.0
+    C_small = 1.0/6.0 - th2/120.0 + th4/5040.0
+
+    small = (theta <= 1e-4)  # threshold can be tuned
+    small = small.unsqueeze(-1).unsqueeze(-1)
+
+    B = torch.where(small, B_small, B_large)
+    C = torch.where(small, C_small, C_large)
+
+    V = I3 + B * Omega + C * Omega2                      # (...,3,3)
+    t = (V @ v.unsqueeze(-1)).squeeze(-1)                # (...,3)
+
+    # --- Assemble T ---
+    T = torch.zeros((*batch_shape, 4, 4), device=device, dtype=dtype)
+    T[..., :3, :3] = R
+    T[..., :3, 3]  = t
+    T[..., 3, 3]   = 1.0
+    return T
+
 def log_SE3_fast(T):
     # returns matrix-form se(3) logs: (...,4,4) with 3x3 skew + 3x1 v
     R = T[..., :3, :3]

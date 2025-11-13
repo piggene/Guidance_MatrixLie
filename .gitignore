@@ -8,3 +8,5 @@ dataset/
 train_results/
 pretrained_models/
 test_results/
+logs/
+data/reach_irn/
