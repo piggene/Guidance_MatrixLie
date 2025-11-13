@@ -10,3 +10,4 @@ pretrained_models/
 test_results/
 logs/
 data/reach_irn/
+checkpoints/
