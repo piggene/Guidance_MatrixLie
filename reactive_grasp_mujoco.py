@@ -330,8 +330,8 @@ def build_mujoco_scene_with_include(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--train_result_path', type=str, required=True)
-    parser.add_argument('--checkpoint', type=str, required=True)
+    parser.add_argument('--train_result_path', type=str, default='pretrained_models/equigraspflow_full')
+    parser.add_argument('--checkpoint', type=str, default='model_best_val_loss.pkl')
     parser.add_argument('--guide_type', type=str, default='none')
     parser.add_argument('--device', default='0')  # 'cpu' or CUDA index string
     parser.add_argument('--obj_type', default='Mug')
